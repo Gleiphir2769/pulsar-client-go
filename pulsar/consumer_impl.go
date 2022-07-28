@@ -36,8 +36,8 @@ import (
 const defaultNackRedeliveryDelay = 1 * time.Minute
 
 type acker interface {
-	AckID(id trackingMessageID) error
-	NackID(id trackingMessageID)
+	AckID(id MessageID) error
+	NackID(id MessageID)
 	NackMsg(msg Message)
 }
 
@@ -453,16 +453,13 @@ func (c *consumer) Ack(msg Message) error {
 
 // AckID the consumption of a single message, identified by its MessageID
 func (c *consumer) AckID(msgID MessageID) error {
-	mid, ok := c.messageID(msgID)
-	if !ok {
-		return errors.New("failed to convert trackingMessageID")
+	if msgID.PartitionIdx() < 0 || int(msgID.PartitionIdx()) >= len(c.consumers) {
+		c.log.Errorf("invalid partition index %d expected a partition between [0-%d]",
+			msgID.PartitionIdx(), len(c.consumers))
+		return errors.New("invalid partition index")
 	}
 
-	if mid.consumer != nil {
-		return mid.Ack()
-	}
-
-	return c.consumers[mid.partitionIdx].AckID(mid)
+	return c.consumers[msgID.PartitionIdx()].AckID(msgID)
 }
 
 // ReconsumeLater mark a message for redelivery after custom delay

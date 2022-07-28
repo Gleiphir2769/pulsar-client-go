@@ -18,6 +18,7 @@
 package pulsar
 
 import (
+	"container/list"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -150,6 +151,9 @@ type partitionConsumer struct {
 	metrics              *internal.LeveledMetrics
 	decryptor            cryptointernal.Decryptor
 	schemaInfoCache      *schemaInfoCache
+
+	chunkedMsgCtxMap          *chunkedMsgCtxMap
+	unAckedChunkedIDSequences *unAckedChunkedIDSequences
 }
 
 type schemaInfoCache struct {
@@ -366,17 +370,29 @@ func (pc *partitionConsumer) requestGetLastMessageID() (trackingMessageID, error
 	return convertToMessageID(id), nil
 }
 
-func (pc *partitionConsumer) AckID(msgID trackingMessageID) error {
+func (pc *partitionConsumer) AckID(msgID MessageID) error {
 	if state := pc.getConsumerState(); state == consumerClosed || state == consumerClosing {
 		pc.log.WithField("state", state).Error("Failed to ack by closing or closed consumer")
 		return errors.New("consumer state is closed")
 	}
 
 	ackReq := new(ackRequest)
-	if !msgID.Undefined() && msgID.ack() {
+
+	if tmid, ok := toTrackingMessageID(msgID); ok {
+		if tmid.ack() {
+			pc.metrics.AcksCounter.Inc()
+			pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-tmid.receivedTime.UnixNano()) / 1.0e9)
+			ackReq.msgID = tmid
+			// send ack request to eventsCh
+			pc.eventsCh <- ackReq
+
+			pc.options.interceptors.OnAcknowledge(pc.parentConsumer, msgID)
+		}
+	} else if cmid, ok := toChunkedMessageID(msgID); ok {
+		// todo: too redundent, maybe better implement
 		pc.metrics.AcksCounter.Inc()
-		pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-msgID.receivedTime.UnixNano()) / 1.0e9)
-		ackReq.msgID = msgID
+		pc.metrics.ProcessingTime.Observe(float64(time.Now().UnixNano()-cmid.receivedTime.UnixNano()) / 1.0e9)
+		ackReq.msgID = cmid
 		// send ack request to eventsCh
 		pc.eventsCh <- ackReq
 
@@ -386,8 +402,8 @@ func (pc *partitionConsumer) AckID(msgID trackingMessageID) error {
 	return ackReq.err
 }
 
-func (pc *partitionConsumer) NackID(msgID trackingMessageID) {
-	pc.nackTracker.Add(msgID.messageID)
+func (pc *partitionConsumer) NackID(msgID MessageID) {
+	pc.nackTracker.Add(msgID)
 	pc.metrics.NacksCounter.Inc()
 }
 
@@ -570,8 +586,8 @@ func (pc *partitionConsumer) internalAck(req *ackRequest) {
 
 	messageIDs := make([]*pb.MessageIdData, 1)
 	messageIDs[0] = &pb.MessageIdData{
-		LedgerId: proto.Uint64(uint64(msgID.ledgerID)),
-		EntryId:  proto.Uint64(uint64(msgID.entryID)),
+		LedgerId: proto.Uint64(uint64(msgID.LedgerID())),
+		EntryId:  proto.Uint64(uint64(msgID.EntryID())),
 	}
 
 	reqID := pc.client.rpcClient.NewRequestID()
@@ -660,9 +676,25 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		}
 	}
 
+	isChunkedMsg := false
+	if msgMeta.GetNumChunksFromMsg() > 1 {
+		isChunkedMsg = true
+	}
+
+	processedPayloadBuffer := internal.NewBufferWrapper(decryptedPayload)
+	if isChunkedMsg {
+		processedPayloadBuffer = pc.processMessageChunk(processedPayloadBuffer, msgMeta, pbMsgID)
+		if processedPayloadBuffer == nil {
+			return nil
+		}
+	} else {
+		processedPayloadBuffer = internal.NewBufferWrapper(decryptedPayload)
+	}
+
 	// decryption is success, decompress the payload
-	uncompressedHeadersAndPayload, err := pc.Decompress(msgMeta, internal.NewBufferWrapper(decryptedPayload))
+	uncompressedHeadersAndPayload, err := pc.Decompress(msgMeta, processedPayloadBuffer)
 	if err != nil {
+		// todo: chunk discard?
 		pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_DecompressionError)
 		return err
 	}
@@ -676,17 +708,46 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 	}
 
 	messages := make([]*message, 0)
-	var ackTracker *ackTracker
-	// are there multiple messages in this batch?
-	if numMsgs > 1 {
-		ackTracker = newAckTracker(numMsgs)
-	}
 
 	pc.metrics.MessagesReceived.Add(float64(numMsgs))
 	pc.metrics.PrefetchedMessages.Add(float64(numMsgs))
 
-	for i := 0; i < numMsgs; i++ {
-		smm, payload, err := reader.ReadMessage()
+	var messageIndex *uint64
+	var brokerPublishTime *time.Time
+	var msg *message
+
+	// If no batched
+	if numMsgs == 1 && msgMeta.NumChunksFromMsg == nil {
+		var msgID MessageID
+		if isChunkedMsg {
+			ctx := pc.chunkedMsgCtxMap.get(msgMeta.GetUuid())
+			if len(ctx.chunkedMsgIDs) > 0 {
+				msgID = newChunkMessageID(ctx.firstChunkID(), ctx.lastChunkID())
+				// todo: maybe race
+				pc.unAckedChunkedIDSequences.add(string(msgID.Serialize()), ctx.chunkedMsgIDs)
+			}
+			// todo: no unackedTracker
+		} else {
+			msgID = messageID{
+				ledgerID:     int64(pbMsgID.GetLedgerId()),
+				entryID:      int64(pbMsgID.GetEntryId()),
+				batchIdx:     -1,
+				partitionIdx: pc.partitionIdx,
+			}
+		}
+
+		if brokerMetadata != nil {
+			if brokerMetadata.Index != nil {
+				aux := brokerMetadata.GetIndex() - uint64(numMsgs) + 1
+				messageIndex = &aux
+			}
+			if brokerMetadata.BrokerTimestamp != nil {
+				aux := timeFromUnixTimestampMillis(*brokerMetadata.BrokerTimestamp)
+				brokerPublishTime = &aux
+			}
+		}
+
+		_, payload, err := reader.ReadMessage()
 		if err != nil || payload == nil {
 			pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_BatchDeSerializeError)
 			return err
@@ -695,33 +756,69 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 		pc.metrics.BytesReceived.Add(float64(len(payload)))
 		pc.metrics.PrefetchedBytes.Add(float64(len(payload)))
 
-		msgID := newTrackingMessageID(
-			int64(pbMsgID.GetLedgerId()),
-			int64(pbMsgID.GetEntryId()),
-			int32(i),
-			pc.partitionIdx,
-			ackTracker)
+		msg = &message{
+			publishTime:         timeFromUnixTimestampMillis(msgMeta.GetPublishTime()),
+			eventTime:           timeFromUnixTimestampMillis(msgMeta.GetEventTime()),
+			key:                 msgMeta.GetPartitionKey(),
+			producerName:        msgMeta.GetProducerName(),
+			properties:          internal.ConvertToStringMap(msgMeta.GetProperties()),
+			topic:               pc.topic,
+			msgID:               msgID,
+			payLoad:             payload,
+			schema:              pc.options.schema,
+			replicationClusters: msgMeta.GetReplicateTo(),
+			replicatedFrom:      msgMeta.GetReplicatedFrom(),
+			redeliveryCount:     response.GetRedeliveryCount(),
+			schemaVersion:       msgMeta.GetSchemaVersion(),
+			schemaInfoCache:     pc.schemaInfoCache,
+			index:               messageIndex,
+			brokerPublishTime:   brokerPublishTime,
+		}
 
-		if pc.messageShouldBeDiscarded(msgID) {
-			pc.AckID(msgID)
-			continue
-		}
-		var messageIndex *uint64
-		var brokerPublishTime *time.Time
-		if brokerMetadata != nil {
-			if brokerMetadata.Index != nil {
-				aux := brokerMetadata.GetIndex() - uint64(numMsgs) + uint64(i) + 1
-				messageIndex = &aux
+		pc.options.interceptors.BeforeConsume(ConsumerMessage{
+			Consumer: pc.parentConsumer,
+			Message:  msg,
+		})
+
+		messages = append(messages, msg)
+	} else {
+		for i := 0; i < numMsgs; i++ {
+			tracker := newAckTracker(numMsgs)
+			smm, payload, err := reader.ReadMessage()
+			if err != nil || payload == nil {
+				pc.discardCorruptedMessage(pbMsgID, pb.CommandAck_BatchDeSerializeError)
+				return err
 			}
-			if brokerMetadata.BrokerTimestamp != nil {
-				aux := timeFromUnixTimestampMillis(*brokerMetadata.BrokerTimestamp)
-				brokerPublishTime = &aux
+
+			pc.metrics.BytesReceived.Add(float64(len(payload)))
+			pc.metrics.PrefetchedBytes.Add(float64(len(payload)))
+
+			msgID := newTrackingMessageID(
+				int64(pbMsgID.GetLedgerId()),
+				int64(pbMsgID.GetEntryId()),
+				int32(i),
+				pc.partitionIdx,
+				tracker)
+
+			if pc.messageShouldBeDiscarded(msgID) {
+				pc.AckID(msgID)
+				continue
 			}
-		}
-		// set the consumer so we know how to ack the message id
-		msgID.consumer = pc
-		var msg *message
-		if smm != nil {
+			var messageIndex *uint64
+			var brokerPublishTime *time.Time
+			if brokerMetadata != nil {
+				if brokerMetadata.Index != nil {
+					aux := brokerMetadata.GetIndex() - uint64(numMsgs) + uint64(i) + 1
+					messageIndex = &aux
+				}
+				if brokerMetadata.BrokerTimestamp != nil {
+					aux := timeFromUnixTimestampMillis(*brokerMetadata.BrokerTimestamp)
+					brokerPublishTime = &aux
+				}
+			}
+			// set the consumer so we know how to ack the message id
+			msgID.consumer = pc
+
 			msg = &message{
 				publishTime:         timeFromUnixTimestampMillis(msgMeta.GetPublishTime()),
 				eventTime:           timeFromUnixTimestampMillis(smm.GetEventTime()),
@@ -741,38 +838,74 @@ func (pc *partitionConsumer) MessageReceived(response *pb.CommandMessage, header
 				index:               messageIndex,
 				brokerPublishTime:   brokerPublishTime,
 			}
-		} else {
-			msg = &message{
-				publishTime:         timeFromUnixTimestampMillis(msgMeta.GetPublishTime()),
-				eventTime:           timeFromUnixTimestampMillis(msgMeta.GetEventTime()),
-				key:                 msgMeta.GetPartitionKey(),
-				producerName:        msgMeta.GetProducerName(),
-				properties:          internal.ConvertToStringMap(msgMeta.GetProperties()),
-				topic:               pc.topic,
-				msgID:               msgID,
-				payLoad:             payload,
-				schema:              pc.options.schema,
-				replicationClusters: msgMeta.GetReplicateTo(),
-				replicatedFrom:      msgMeta.GetReplicatedFrom(),
-				redeliveryCount:     response.GetRedeliveryCount(),
-				schemaVersion:       msgMeta.GetSchemaVersion(),
-				schemaInfoCache:     pc.schemaInfoCache,
-				index:               messageIndex,
-				brokerPublishTime:   brokerPublishTime,
-			}
+
+			pc.options.interceptors.BeforeConsume(ConsumerMessage{
+				Consumer: pc.parentConsumer,
+				Message:  msg,
+			})
+
+			messages = append(messages, msg)
 		}
-
-		pc.options.interceptors.BeforeConsume(ConsumerMessage{
-			Consumer: pc.parentConsumer,
-			Message:  msg,
-		})
-
-		messages = append(messages, msg)
 	}
 
 	// send messages to the dispatcher
 	pc.queueCh <- messages
 	return nil
+}
+
+func (pc *partitionConsumer) processMessageChunk(compressedPayload internal.Buffer,
+	msgMeta *pb.MessageMetadata,
+	pbMsgID *pb.MessageIdData) internal.Buffer {
+	// todo: expire incomplete chunk message
+	uuid := msgMeta.GetUuid()
+	numChunks := msgMeta.GetNumChunksFromMsg()
+	totalChunksSize := int(msgMeta.GetTotalChunkMsgSize())
+	chunkID := msgMeta.GetChunkId()
+	msgID := messageID{
+		ledgerID:     int64(pbMsgID.GetLedgerId()),
+		entryID:      int64(pbMsgID.GetEntryId()),
+		batchIdx:     -1,
+		partitionIdx: pc.partitionIdx,
+	}
+
+	if msgMeta.GetChunkId() == 0 {
+		pc.chunkedMsgCtxMap.addIfAbsent(uuid,
+			numChunks,
+			totalChunksSize,
+		)
+	}
+
+	ctx := pc.chunkedMsgCtxMap.get(uuid)
+	expectedTotalSize := compressedPayload.ReadableBytes() + ctx.chunkedMsgBuffer.ReadableBytes()
+
+	if ctx == nil || ctx.chunkedMsgBuffer == nil || chunkID != ctx.lastChunkedMsgID+1 ||
+		int32(expectedTotalSize) > msgMeta.GetTotalChunkMsgSize() {
+		lastChunkedMsgID := -1
+		totalChunks := -1
+		if ctx != nil {
+			lastChunkedMsgID = int(ctx.lastChunkedMsgID)
+			totalChunks = int(ctx.totalChunks)
+			// todo: how to release buffer
+			ctx.chunkedMsgBuffer.Clear()
+		}
+		pc.log.Info(fmt.Sprintf(
+			"Received unexpected chunk messageId %s, last-chunk-id %d, chunkId = %d, total-chunks %d",
+			msgID.Serialize(), lastChunkedMsgID, chunkID, totalChunks))
+		pc.chunkedMsgCtxMap.remove(uuid)
+		pc.availablePermits++
+		// todo: expire tracker ack
+		return nil
+	}
+
+	ctx.refresh(chunkID, msgID, compressedPayload)
+
+	if msgMeta.GetChunkId() != msgMeta.GetNumChunksFromMsg()-1 {
+		pc.availablePermits++
+		// todo: how to release buffer
+		return nil
+	}
+
+	return ctx.chunkedMsgBuffer
 }
 
 func (pc *partitionConsumer) messageShouldBeDiscarded(msgID trackingMessageID) bool {
@@ -986,7 +1119,7 @@ func (pc *partitionConsumer) dispatcher() {
 }
 
 type ackRequest struct {
-	msgID trackingMessageID
+	msgID MessageID
 	err   error
 }
 
@@ -1443,4 +1576,106 @@ func convertToMessageID(id *pb.MessageIdData) trackingMessageID {
 	}
 
 	return msgID
+}
+
+type chunkedMsgCtx struct {
+	totalChunks      int32
+	chunkedMsgBuffer internal.Buffer
+	lastChunkedMsgID int32
+	chunkedMsgIDs    []messageID
+	receivedTime     int64
+}
+
+func newChunkedMsgCtx(numChunksFromMsg int32, totalChunkMsgSize int) *chunkedMsgCtx {
+	return &chunkedMsgCtx{
+		totalChunks:      numChunksFromMsg,
+		chunkedMsgBuffer: internal.NewBuffer(totalChunkMsgSize),
+		lastChunkedMsgID: -1,
+		chunkedMsgIDs:    make([]messageID, numChunksFromMsg),
+		receivedTime:     time.Now().Unix(),
+	}
+}
+
+func (c *chunkedMsgCtx) refresh(chunkID int32, msgID messageID, partPayload internal.Buffer) {
+	c.chunkedMsgIDs[chunkID] = msgID
+	c.chunkedMsgBuffer.Write(partPayload.ReadableSlice())
+	c.lastChunkedMsgID = chunkID
+}
+
+func (c *chunkedMsgCtx) firstChunkID() messageID {
+	if len(c.chunkedMsgIDs) == 0 {
+		return messageID{}
+	}
+	return c.chunkedMsgIDs[0]
+}
+
+func (c *chunkedMsgCtx) lastChunkID() messageID {
+	if len(c.chunkedMsgIDs) == 0 {
+		return messageID{}
+	}
+	return c.chunkedMsgIDs[len(c.chunkedMsgIDs)-1]
+}
+
+type chunkedMsgCtxMap struct {
+	chunkedMsgCtxs map[string]*chunkedMsgCtx
+	pendingQueue   *list.List
+	maxLength      int
+	mu             sync.Mutex
+}
+
+func (c *chunkedMsgCtxMap) addIfAbsent(uuid string, totalChunks int32, totalChunkMsgSize int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.chunkedMsgCtxs[uuid]; !ok {
+		c.chunkedMsgCtxs[uuid] = newChunkedMsgCtx(totalChunks, totalChunkMsgSize)
+		c.pendingQueue.PushBack(uuid)
+	}
+	if c.maxLength > 0 {
+		c.evictIfFull()
+	}
+}
+
+func (c *chunkedMsgCtxMap) evictIfFull() {
+	if c.pendingQueue.Len() >= c.maxLength {
+		e := c.pendingQueue.Front()
+		delete(c.chunkedMsgCtxs, e.Value.(string))
+		c.pendingQueue.Remove(e)
+	}
+}
+
+func (c *chunkedMsgCtxMap) get(uuid string) *chunkedMsgCtx {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.chunkedMsgCtxs[uuid]
+}
+
+func (c *chunkedMsgCtxMap) remove(uuid string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.chunkedMsgCtxs, uuid)
+	e := c.pendingQueue.Front()
+	for e != nil {
+		if e.Value.(string) == uuid {
+			c.pendingQueue.Remove(e)
+			break
+		}
+	}
+}
+
+type unAckedChunkedIDSequences struct {
+	mu sync.Mutex
+
+	ids map[string][]messageID
+}
+
+func (u *unAckedChunkedIDSequences) add(chunkIDStr string, unAckedIDs []messageID) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.ids[chunkIDStr] = unAckedIDs
+}
+
+func (u *unAckedChunkedIDSequences) get(chunkIDStr string) []messageID {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.ids[chunkIDStr]
 }
