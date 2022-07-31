@@ -481,15 +481,23 @@ func (pc *partitionConsumer) Close() {
 	<-req.doneCh
 }
 
-func (pc *partitionConsumer) Seek(msgID trackingMessageID) error {
+func (pc *partitionConsumer) Seek(msgID MessageID) error {
 	if state := pc.getConsumerState(); state == consumerClosed || state == consumerClosing {
 		pc.log.WithField("state", state).Error("Failed to seek by closing or closed consumer")
 		return errors.New("failed to seek by closing or closed consumer")
 	}
 	req := &seekRequest{
 		doneCh: make(chan struct{}),
-		msgID:  msgID,
 	}
+	if tmid, ok := toTrackingMessageID(msgID); ok {
+		req.msgID = tmid.messageID
+	} else if cmid, ok := toChunkedMessageID(msgID); ok {
+		req.msgID = cmid.firstChunkID
+	} else {
+		// will never reach
+		return errors.New("unhandled messageID type")
+	}
+
 	pc.eventsCh <- req
 
 	// wait for the request to complete
@@ -499,7 +507,7 @@ func (pc *partitionConsumer) Seek(msgID trackingMessageID) error {
 
 func (pc *partitionConsumer) internalSeek(seek *seekRequest) {
 	defer close(seek.doneCh)
-	seek.err = pc.requestSeek(seek.msgID.messageID)
+	seek.err = pc.requestSeek(seek.msgID)
 }
 func (pc *partitionConsumer) requestSeek(msgID messageID) error {
 	if err := pc.requestSeekWithoutClear(msgID); err != nil {
@@ -1162,7 +1170,7 @@ type getLastMsgIDRequest struct {
 
 type seekRequest struct {
 	doneCh chan struct{}
-	msgID  trackingMessageID
+	msgID  messageID
 	err    error
 }
 
