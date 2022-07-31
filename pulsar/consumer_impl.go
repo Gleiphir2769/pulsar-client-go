@@ -91,6 +91,15 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		}
 	}
 
+	if options.MaxPendingChunkedMessage == 0 {
+		options.MaxPendingChunkedMessage = 100
+	}
+
+	// the minimum timer interval is 100ms
+	if options.ExpireTimeOfIncompleteChunk < 100*time.Millisecond {
+		options.ExpireTimeOfIncompleteChunk = time.Minute
+	}
+
 	if options.NackBackoffPolicy == nil && options.EnableDefaultNackBackoffPolicy {
 		options.NackBackoffPolicy = new(defaultNackBackoffPolicy)
 	}
@@ -342,27 +351,30 @@ func (c *consumer) internalTopicSubscribeToPartitions() error {
 				nackRedeliveryDelay = c.options.NackRedeliveryDelay
 			}
 			opts := &partitionConsumerOpts{
-				topic:                      pt,
-				consumerName:               c.consumerName,
-				subscription:               c.options.SubscriptionName,
-				subscriptionType:           c.options.Type,
-				subscriptionInitPos:        c.options.SubscriptionInitialPosition,
-				partitionIdx:               idx,
-				receiverQueueSize:          receiverQueueSize,
-				nackRedeliveryDelay:        nackRedeliveryDelay,
-				nackBackoffPolicy:          c.options.NackBackoffPolicy,
-				metadata:                   metadata,
-				subProperties:              subProperties,
-				replicateSubscriptionState: c.options.ReplicateSubscriptionState,
-				startMessageID:             trackingMessageID{},
-				subscriptionMode:           durable,
-				readCompacted:              c.options.ReadCompacted,
-				interceptors:               c.options.Interceptors,
-				maxReconnectToBroker:       c.options.MaxReconnectToBroker,
-				keySharedPolicy:            c.options.KeySharedPolicy,
-				schema:                     c.options.Schema,
-				decryption:                 c.options.Decryption,
-				ackWithResponse:            c.options.AckWithResponse,
+				topic:                       pt,
+				consumerName:                c.consumerName,
+				subscription:                c.options.SubscriptionName,
+				subscriptionType:            c.options.Type,
+				subscriptionInitPos:         c.options.SubscriptionInitialPosition,
+				partitionIdx:                idx,
+				receiverQueueSize:           receiverQueueSize,
+				nackRedeliveryDelay:         nackRedeliveryDelay,
+				nackBackoffPolicy:           c.options.NackBackoffPolicy,
+				metadata:                    metadata,
+				subProperties:               subProperties,
+				replicateSubscriptionState:  c.options.ReplicateSubscriptionState,
+				startMessageID:              trackingMessageID{},
+				subscriptionMode:            durable,
+				readCompacted:               c.options.ReadCompacted,
+				interceptors:                c.options.Interceptors,
+				maxReconnectToBroker:        c.options.MaxReconnectToBroker,
+				keySharedPolicy:             c.options.KeySharedPolicy,
+				schema:                      c.options.Schema,
+				decryption:                  c.options.Decryption,
+				ackWithResponse:             c.options.AckWithResponse,
+				maxPendingChunkedMessage:    c.options.MaxPendingChunkedMessage,
+				expireTimeOfIncompleteChunk: c.options.ExpireTimeOfIncompleteChunk,
+				autoAckIncompleteChunk:      c.options.AutoAckIncompleteChunk,
 			}
 			cons, err := newPartitionConsumer(c, c.client, opts, c.messageCh, c.dlq, c.metrics)
 			ch <- ConsumerError{
