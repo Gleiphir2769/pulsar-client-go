@@ -155,9 +155,8 @@ type partitionConsumer struct {
 	decryptor            cryptointernal.Decryptor
 	schemaInfoCache      *schemaInfoCache
 
-	chunkedMsgCtxMap                           *chunkedMsgCtxMap
-	unAckedChunkedIDSequences                  *unAckedChunkedIDSequences
-	expireTimeOfIncompleteChunkedMessageMillis time.Duration
+	chunkedMsgCtxMap          *chunkedMsgCtxMap
+	unAckedChunkedIDSequences *unAckedChunkedIDSequences
 }
 
 type schemaInfoCache struct {
@@ -896,10 +895,9 @@ func (pc *partitionConsumer) processMessageChunk(compressedPayload internal.Buff
 	}
 
 	ctx := pc.chunkedMsgCtxMap.get(uuid)
-	expectedTotalSize := compressedPayload.ReadableBytes() + ctx.chunkedMsgBuffer.ReadableBytes()
 
 	if ctx == nil || ctx.chunkedMsgBuffer == nil || chunkID != ctx.lastChunkedMsgID+1 ||
-		int32(expectedTotalSize) > msgMeta.GetTotalChunkMsgSize() {
+		int32(compressedPayload.ReadableBytes()+ctx.chunkedMsgBuffer.ReadableBytes()) > msgMeta.GetTotalChunkMsgSize() {
 		lastChunkedMsgID := -1
 		totalChunks := -1
 		if ctx != nil {
@@ -911,7 +909,7 @@ func (pc *partitionConsumer) processMessageChunk(compressedPayload internal.Buff
 		pc.log.Info(fmt.Sprintf(
 			"Received unexpected chunk messageId %s, last-chunk-id %d, chunkId = %d, total-chunks %d",
 			msgID.Serialize(), lastChunkedMsgID, chunkID, totalChunks))
-		pc.chunkedMsgCtxMap.removeChunkMessage(uuid, true)
+		pc.chunkedMsgCtxMap.remove(uuid)
 		pc.availablePermits++
 		// todo: expire tracker ack
 		return nil
@@ -1674,8 +1672,8 @@ func (c *chunkedMsgCtxMap) addIfAbsent(uuid string, totalChunks int32, totalChun
 			c.removeChunkMessage(uuid, c.pc.options.autoAckIncompleteChunk)
 		})
 	}
-	if c.maxPending > 0 && c.pendingQueue.Len() >= c.maxPending {
-		c.removeChunkMessage(uuid, c.pc.options.autoAckIncompleteChunk)
+	if c.maxPending > 0 && c.pendingQueue.Len() > c.maxPending {
+		go c.removeChunkMessage(uuid, c.pc.options.autoAckIncompleteChunk)
 	}
 }
 
@@ -1696,7 +1694,7 @@ func (c *chunkedMsgCtxMap) remove(uuid string) {
 	}
 	delete(c.chunkedMsgCtxs, uuid)
 	e := c.pendingQueue.Front()
-	for e != nil {
+	for ; e != nil; e = e.Next() {
 		if e.Value.(string) == uuid {
 			c.pendingQueue.Remove(e)
 			break
@@ -1722,7 +1720,7 @@ func (c *chunkedMsgCtxMap) removeChunkMessage(uuid string, autoAck bool) {
 	}
 	delete(c.chunkedMsgCtxs, uuid)
 	e := c.pendingQueue.Front()
-	for e != nil {
+	for ; e != nil; e = e.Next() {
 		if e.Value.(string) == uuid {
 			c.pendingQueue.Remove(e)
 			break
