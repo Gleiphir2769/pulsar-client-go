@@ -217,6 +217,16 @@ func newMessageID(ledgerID int64, entryID int64, batchIdx int32, partitionIdx in
 	}
 }
 
+func fromMessageID(msgID MessageID) messageID {
+	return messageID{
+		ledgerID:     msgID.LedgerID(),
+		entryID:      msgID.EntryID(),
+		batchIdx:     msgID.BatchIdx(),
+		partitionIdx: msgID.PartitionIdx(),
+		batchSize:    msgID.BatchSize(),
+	}
+}
+
 func newTrackingMessageID(ledgerID int64, entryID int64, batchIdx int32, partitionIdx int32, batchSize int32,
 	tracker *ackTracker) trackingMessageID {
 	return trackingMessageID{
@@ -233,21 +243,12 @@ func newTrackingMessageID(ledgerID int64, entryID int64, batchIdx int32, partiti
 }
 
 func toTrackingMessageID(msgID MessageID) (trackingMessageID, bool) {
-	if mid, ok := msgID.(messageID); ok {
-		return trackingMessageID{
-			messageID:    mid,
-			receivedTime: time.Now(),
-		}, true
-	} else if mid, ok := msgID.(trackingMessageID); ok {
+	if mid, ok := msgID.(trackingMessageID); ok {
 		return mid, true
-	} else if cmid, ok := msgID.(chunkMessageID); ok {
-		return trackingMessageID{
-			messageID:    cmid.messageID,
-			receivedTime: cmid.receivedTime,
-			consumer:     cmid.consumer,
-		}, true
 	} else {
-		return trackingMessageID{}, false
+		return trackingMessageID{
+			messageID: fromMessageID(msgID),
+		}, false
 	}
 }
 

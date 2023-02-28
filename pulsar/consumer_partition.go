@@ -41,10 +41,6 @@ import (
 	uAtomic "go.uber.org/atomic"
 )
 
-var (
-	lastestMessageID = LatestMessageID()
-)
-
 type consumerState int
 
 const (
@@ -98,7 +94,7 @@ type partitionConsumerOpts struct {
 	metadata                    map[string]string
 	subProperties               map[string]string
 	replicateSubscriptionState  bool
-	startMessageID              trackingMessageID
+	startMessageID              MessageID
 	startMessageIDInclusive     bool
 	subscriptionMode            subscriptionMode
 	readCompacted               bool
@@ -148,8 +144,11 @@ type partitionConsumer struct {
 	// the size of the queue channel for buffering messages
 	queueSize       int32
 	queueCh         chan []*message
-	startMessageID  atomicMessageID
+	startMessageID  *atomicMessageID
 	lastDequeuedMsg trackingMessageID
+
+	seekMessageID trackingMessageID
+	duringSeek    atomic.Bool
 
 	eventsCh        chan interface{}
 	connectedCh     chan struct{}
@@ -233,6 +232,25 @@ func (a *atomicMessageID) set(msgID trackingMessageID) {
 	a.msgID = msgID
 }
 
+func newStartMessageID(msgID MessageID) *atomicMessageID {
+	if chunkMsgID, ok := toChunkedMessageID(msgID); ok {
+		return &atomicMessageID{msgID: trackingMessageID{
+			messageID:    chunkMsgID.firstChunkID,
+			receivedTime: chunkMsgID.receivedTime,
+			consumer:     chunkMsgID.consumer,
+		}}
+	}
+
+	if trackingMsgID, ok := toTrackingMessageID(msgID); ok {
+		return &atomicMessageID{msgID: trackingMsgID}
+	} else {
+		return &atomicMessageID{msgID: trackingMessageID{
+			messageID:    latestMessageID,
+			receivedTime: time.Now(),
+		}}
+	}
+}
+
 type schemaInfoCache struct {
 	lock   sync.RWMutex
 	cache  map[string]Schema
@@ -298,7 +316,7 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 		eventsCh:             make(chan interface{}, 10),
 		queueSize:            int32(options.receiverQueueSize),
 		queueCh:              make(chan []*message, options.receiverQueueSize),
-		startMessageID:       atomicMessageID{msgID: options.startMessageID},
+		startMessageID:       newStartMessageID(options.startMessageID),
 		connectedCh:          make(chan struct{}),
 		messageCh:            messageCh,
 		connectClosedCh:      make(chan connectionClosed, 10),
@@ -347,7 +365,7 @@ func newPartitionConsumer(parent Consumer, client *client, options *partitionCon
 	pc.log.Info("Created consumer")
 	pc.setConsumerState(consumerReady)
 
-	if pc.options.startMessageIDInclusive && pc.startMessageID.get().equal(lastestMessageID.(messageID)) {
+	if pc.options.startMessageIDInclusive && pc.startMessageID.get().equal(LatestMessageID().(messageID)) {
 		msgID, err := pc.requestGetLastMessageID()
 		if err != nil {
 			pc.nackTracker.Close()
@@ -684,10 +702,16 @@ func (pc *partitionConsumer) Seek(msgID MessageID) error {
 	}
 
 	pc.ackGroupingTracker.flushAndClean()
+	pc.duringSeek.CompareAndSwap(false, true)
+	originalSeekID := pc.seekMessageID
+	pc.seekMessageID, _ = toTrackingMessageID(req.msgID)
 	pc.eventsCh <- req
 
 	// wait for the request to complete
 	<-req.doneCh
+	if req.err != nil {
+		pc.seekMessageID = originalSeekID
+	}
 	return req.err
 }
 
@@ -1110,7 +1134,7 @@ func (pc *partitionConsumer) messageShouldBeDiscarded(msgID trackingMessageID) b
 		return false
 	}
 	// if we start at latest message, we should never discard
-	if pc.options.startMessageID.equal(latestMessageID) {
+	if pc.startMessageID.get().equal(latestMessageID) {
 		return false
 	}
 
@@ -1602,7 +1626,9 @@ func (pc *partitionConsumer) clearQueueAndGetNextMessage() trackingMessageID {
 func (pc *partitionConsumer) clearReceiverQueue() trackingMessageID {
 	nextMessageInQueue := pc.clearQueueAndGetNextMessage()
 
-	if pc.startMessageID.get().Undefined() {
+	if pc.duringSeek.CompareAndSwap(true, false) {
+		return pc.seekMessageID
+	} else if pc.options.subscriptionMode == durable {
 		return pc.startMessageID.get()
 	}
 

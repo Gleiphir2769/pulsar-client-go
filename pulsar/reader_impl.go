@@ -51,20 +51,20 @@ func newReader(client *client, options ReaderOptions) (Reader, error) {
 		return nil, newError(InvalidConfiguration, "StartMessageID is required")
 	}
 
-	startMessageID, ok := toTrackingMessageID(options.StartMessageID)
-	if !ok {
-		// a custom type satisfying MessageID may not be a messageID or trackingMessageID
-		// so re-create messageID using its data
-		deserMsgID, err := deserializeMessageID(options.StartMessageID.Serialize())
-		if err != nil {
-			return nil, err
-		}
-		// de-serialized MessageID is a messageID
-		startMessageID = trackingMessageID{
-			messageID:    deserMsgID.(messageID),
-			receivedTime: time.Now(),
-		}
-	}
+	//startMessageID, ok := toTrackingMessageID(options.StartMessageID)
+	//if !ok {
+	//	// a custom type satisfying MessageID may not be a messageID or trackingMessageID
+	//	// so re-create messageID using its data
+	//	deserMsgID, err := deserializeMessageID(options.StartMessageID.Serialize())
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//	// de-serialized MessageID is a messageID
+	//	startMessageID = trackingMessageID{
+	//		messageID:    deserMsgID.(messageID),
+	//		receivedTime: time.Now(),
+	//	}
+	//}
 
 	subscriptionName := options.SubscriptionName
 	if subscriptionName == "" {
@@ -97,7 +97,7 @@ func newReader(client *client, options ReaderOptions) (Reader, error) {
 		subscription:               subscriptionName,
 		subscriptionType:           Exclusive,
 		receiverQueueSize:          receiverQueueSize,
-		startMessageID:             startMessageID,
+		startMessageID:             options.StartMessageID,
 		startMessageIDInclusive:    options.StartMessageIDInclusive,
 		subscriptionMode:           nonDurable,
 		readCompacted:              options.ReadCompacted,
