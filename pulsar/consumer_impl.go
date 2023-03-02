@@ -384,6 +384,7 @@ func (c *consumer) internalTopicSubscribeToPartitions() error {
 				subProperties:               subProperties,
 				replicateSubscriptionState:  c.options.ReplicateSubscriptionState,
 				startMessageID:              trackingMessageID{},
+				startMessageIDInclusive:     c.options.StartMessageIDInclusive,
 				subscriptionMode:            durable,
 				readCompacted:               c.options.ReadCompacted,
 				interceptors:                c.options.Interceptors,

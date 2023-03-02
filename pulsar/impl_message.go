@@ -243,12 +243,21 @@ func newTrackingMessageID(ledgerID int64, entryID int64, batchIdx int32, partiti
 }
 
 func toTrackingMessageID(msgID MessageID) (trackingMessageID, bool) {
-	if mid, ok := msgID.(trackingMessageID); ok {
-		return mid, true
-	} else {
+	if mid, ok := msgID.(messageID); ok {
 		return trackingMessageID{
-			messageID: fromMessageID(msgID),
-		}, false
+			messageID:    mid,
+			receivedTime: time.Now(),
+		}, true
+	} else if mid, ok := msgID.(trackingMessageID); ok {
+		return mid, true
+	} else if cmid, ok := msgID.(chunkMessageID); ok {
+		return trackingMessageID{
+			messageID:    cmid.messageID,
+			receivedTime: cmid.receivedTime,
+			consumer:     cmid.consumer,
+		}, true
+	} else {
+		return trackingMessageID{}, false
 	}
 }
 

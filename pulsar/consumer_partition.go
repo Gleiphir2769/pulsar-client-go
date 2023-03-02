@@ -146,9 +146,8 @@ type partitionConsumer struct {
 	queueCh         chan []*message
 	startMessageID  *atomicMessageID
 	lastDequeuedMsg trackingMessageID
-
-	seekMessageID trackingMessageID
-	duringSeek    atomic.Bool
+	seekMessageID   trackingMessageID
+	duringSeek      atomic.Bool
 
 	eventsCh        chan interface{}
 	connectedCh     chan struct{}
@@ -701,9 +700,9 @@ func (pc *partitionConsumer) Seek(msgID MessageID) error {
 		return errors.New("unhandled messageID type")
 	}
 
-	pc.ackGroupingTracker.flushAndClean()
-	pc.duringSeek.CompareAndSwap(false, true)
+	pc.duringSeek.Store(true)
 	originalSeekID := pc.seekMessageID
+	pc.ackGroupingTracker.flushAndClean()
 	pc.seekMessageID, _ = toTrackingMessageID(req.msgID)
 	pc.eventsCh <- req
 
@@ -711,6 +710,7 @@ func (pc *partitionConsumer) Seek(msgID MessageID) error {
 	<-req.doneCh
 	if req.err != nil {
 		pc.seekMessageID = originalSeekID
+		pc.duringSeek.Store(false)
 	}
 	return req.err
 }
@@ -765,11 +765,18 @@ func (pc *partitionConsumer) SeekByTime(time time.Time) error {
 		doneCh:      make(chan struct{}),
 		publishTime: time,
 	}
+
+	originalSeekID := pc.seekMessageID
+	pc.duringSeek.Store(true)
 	pc.ackGroupingTracker.flushAndClean()
 	pc.eventsCh <- req
 
 	// wait for the request to complete
 	<-req.doneCh
+	if req.err != nil {
+		pc.seekMessageID = originalSeekID
+		pc.duringSeek.Store(false)
+	}
 	return req.err
 }
 
