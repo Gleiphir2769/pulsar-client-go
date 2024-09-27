@@ -633,6 +633,7 @@ func addRequestToBatch(smm *pb.SingleMessageMetadata, p *partitionProducer,
 func (p *partitionProducer) genMetadata(msg *ProducerMessage,
 	uncompressedSize int,
 	deliverAt time.Time) (mm *pb.MessageMetadata) {
+
 	mm = &pb.MessageMetadata{
 		ProducerName:     &p.producerName,
 		PublishTime:      proto.Uint64(internal.TimestampMillis(time.Now())),
